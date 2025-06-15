@@ -454,16 +454,16 @@ idxs = [
     Index("SPX", "CBOE"),
     # No NANOS because most brokers don't offer it and it has basically no volume
     # Index("NANOS", "CBOE"),  # SPY-priced index options with no multiplier
-    Index("VIN", "CBOE"),  # VIX Front-Month Component (near term)
-    Index("VIF", "CBOE"),  # VIX Front-er-Month Component (far term)
+    #Index("VIN", "CBOE"),  # VIX Front-Month Component (near term)
+    #Index("VIF", "CBOE"),  # VIX Front-er-Month Component (far term)
     Index("VIX", "CBOE"),  # VIX Currently (a mix of VIN and VIF basically)
     # No VOL-NYSE because it displays billions of shares and breaks our views
     # Index("VOL-NYSE", "NYSE"),
-    Index("TICK-NYSE", "NYSE"),
+    #Index("TICK-NYSE", "NYSE"),
     # > 1 == selling pressure, < 1 == buying pressure; somewhat
-    Index("TRIN-NYSE", "NYSE"),
+    #Index("TRIN-NYSE", "NYSE"),
     # Advancing minus Declining (bid is Advance, ask is Decline) (no idea what the bid/ask qtys represent)
-    Index("AD-NYSE", "NYSE"),
+    #Index("AD-NYSE", "NYSE"),
 ]
 
 # Note: ContFuture is only for historical data; it can't quote or trade.
@@ -535,6 +535,8 @@ class IBKRCmdlineApp:
     liveBars: dict[str, RealTimeBarList] = field(default_factory=dict)
     pnlSingle: dict[int, PnLSingle] = field(default_factory=dict)
     exiting: bool = False
+    strategy: dict[str, dict] = field(default_factory=dict)
+
     ol: buylang.OLang = field(default_factory=buylang.OLang)
     quotehistory: dict[int, deque[float]] = field(
         default_factory=lambda: defaultdict(lambda: deque(maxlen=120))
@@ -1850,7 +1852,6 @@ class IBKRCmdlineApp:
                    isn't working correctly because then you can see the errors/exceptions (if any).
         """
         # logger.info("Ticker update: {}", tickr)
-
         for ticker in tickr:
             c = ticker.contract
             name = (c.localSymbol or c.symbol).replace(" ", "")
@@ -1866,6 +1867,15 @@ class IBKRCmdlineApp:
                 quotekey = c.conId
 
             self.quotehistory[quotekey].append(price)
+            # CHAD tickersUpdate
+            if self.strategy.get(name):
+                alg = self.strategy.get(name)
+                algo = alg.get("algo")
+                start = alg.get("start")
+                logger.error(f"running strategy {name} {algo} {start}")
+                asyncio.create_task(
+                    self.dispatch.runop("runstrat", f'"{name}" "{algo}" "{start}"', self.opstate)
+                )
 
             # this is a synthetic memory-having ATR where we just feed it price data and
             # it calculates a dynamic H/L/C for the actual ATR based on recent price history.
@@ -1876,6 +1886,7 @@ class IBKRCmdlineApp:
                     asyncio.create_task(
                         self.speak.say(say=f"PRICE UP: {name} TO {price:,.2f}")
                     )
+
 
         # TODO: we could also run volume crossover calculations too...
 
