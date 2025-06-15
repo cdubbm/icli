@@ -4,6 +4,7 @@ runlogs/
 dist/
 cache*/
 icli/hist/
+icli/__pycache__
 
 *.log
 *.json
