@@ -26,6 +26,8 @@ from mutil.dispatch import DArg
 from mutil.frame import printFrame
 from mutil.numeric import fmtPrice
 from mutil.timer import Timer
+
+import icli.cli
 from icli.helpers import *
 import asyncio
 
@@ -127,6 +129,7 @@ STRATSTATEMAP = dict(
     L0="New Position",
     L1="TP1 hit waiting on PT1",
     L2="TP2 hit waiting on runners",
+    Z="Finished - cleanup",
 )
 
 # This is a little redundant since it's also configured in cli.py.
@@ -3021,29 +3024,29 @@ class IOpBalance(IOp):
 
 @dataclass
 class IOpStrat1(IOp):
-    levels = {
-                 "L0" :
-                     {"stopLoss": -0.30, "stopLossQty": 1, "takeProfit": 0, "takeProfQty": 0, "isTrail": False, },
-                 "L1":
-                     {"stopLoss": 0.02, "stopLossQty": 1, "takeProfit": 0.30, "takeProfQty": 0.5, "isTrail": False, },
-                 "L2":
-                     {"stopLoss": 0.28, "stopLossQty": 1, "takeProfit": 0.50, "takeProfQty": 0.25, "isTrail": False, },
-                 "L3":
-                     {"stopLoss": -0.20, "stopLossQty": 1, "takeProfit": 0.50, "takeProfQty": 0.25, "isTrail": True, },
-             }
-
     def argmap(self):
         return [
             DArg("symbol", convert=lambda x: x.upper()),
         ]
 
     async def run(self, symbol):
+        self.state = self.state.state
+        levels = {
+            "L0":
+                {"stopLoss": -0.30, "stopLossQty": 1, "takeProfit": 0.30, "takeProfQty": 0.5, "isTrail": False, },
+            "L1":
+                {"stopLoss": 0.28, "stopLossQty": 1, "takeProfit": 0.50, "takeProfQty": 0.5, "isTrail": False, },
+            "L2":
+                {"stopLoss": -0.20, "stopLossQty": 1, "takeProfit": 0.50, "takeProfQty": 1, "isTrail": True, },
+            "Z":
+                {"stopLoss": 0, "stopLossQty": 0, "takeProfit": 0, "takeProfQty": 0, "isTrail": True, },
+        }
+
         ords = self.ib.portfolio()
         f = False
         myPos = None
         for o in ords:
             portcont = o.contract.localSymbol.replace(" ", "")
-
             if portcont == symbol:
                 f = True
                 myPos = o
@@ -3059,22 +3062,30 @@ class IOpStrat1(IOp):
                 pnlPercentage = (myPos.marketPrice * 100 - myPos.averageCost) / myPos.averageCost * 100
                 avgCost = myPos.averageCost / 100
 
-            strategyState = self.state.state.strategy.get(symbol)
+            strategyState = self.state.strategy.get(symbol)
 
-            mktPrice = myPos.marketPrice
+            ticker = self.state.quoteState[symbol]
+            mktPrice = (ticker.bid + ticker.ask) / 2
             algo = strategyState.get("algo")
             stratState = strategyState.get("start")
 
+            contDate = myPos.contract.lastTradeDateOrContractMonth
+            myCurrentDate = datetime.date.today()
+            tradeDate = "%4d%02d%02d" % (myCurrentDate.year, myCurrentDate.month, myCurrentDate.day)
+            isFuture = int(contDate) > int(tradeDate)
+            now = pendulum.now("US/Eastern")
+            untilClose = icli.cli.fetchEndOfMarketDay() - now
+
+            pnlPercentage = ((mktPrice / avgCost) * 100) -100
+            # logger.info(f"S1 strategy in In state quote:{ticker} {mid} {pnlPercentage} {avgCost} ")
+
             if algo == "S1" :
-                logger.info(f"S1 strategy in In state {stratState}")
+                #logger.info(f"S1 strategy in In state stateStrat:{stratState} contractDate:{contDate} today:{tradeDate} contrctFuture:{isFuture} close:{untilClose.seconds} pnl:{pnlPercentage}")
+                level = levels.get(stratState)
 
-                if stratState == "L0" :
-                    logger.info(f"strategy S1 is in state {stratState} and {myPos} {pnlPercentage} {avgCost} {mktPrice}")
-                    strategyState["start"] = "L1"
-
-                if stratState == "L1" :
-                    logger.info(f"strategy S1 is in state {stratState} {pnlPercentage} {avgCost} {mktPrice}")
-                    strategyState["start"] = "L2"
+                if stratState == "Z" or myPos.position < 1:
+                    self.state.strategy.pop(symbol, None)
+                    return
 
                 if "highPrice" in strategyState :
                     oldHigh = strategyState.get("highPrice")
@@ -3082,6 +3093,56 @@ class IOpStrat1(IOp):
                         strategyState["highPrice"] = mktPrice
                 else :
                     strategyState["highPrice"] = mktPrice
+
+                if stratState == "L0" :
+                    #logger.debug(f"strategy S1 is in state {stratState} and {myPos} {pnlPercentage} {avgCost} {mktPrice}")
+                    if pnlPercentage <= (level.get("stopLoss")*100) :
+                        amount = math.ceil(myPos.position * level.get("stopLossQty"))
+                        logger.info(f"Hit stop loss for {symbol} {pnlPercentage} selling {amount}")
+                        await self.runoplive("buy", f"{symbol} -{amount} AMF")
+                        strategyState["start"] = "Z"
+                        return
+
+                    if pnlPercentage > (level.get("takeProfit") *100):
+                        amount =  math.ceil(myPos.position * level.get("takeProfQty"))
+                        logger.info(f"Hit first take profit for {symbol} {pnlPercentage}, selling {amount} ")
+                        await self.runoplive("buy", f"{symbol} -{amount} AMF")
+                        strategyState["start"] = "L1"
+                        return
+
+                if stratState == "L1" :
+                    tp = level.get("takeProfit")*100
+                    #logger.debug(f"strategy S1 is in state {stratState} {pnlPercentage} {avgCost} {mktPrice} {tp}" )
+                    if pnlPercentage <= (level.get("stopLoss")*100):
+                        amount =  math.ceil(myPos.position * level.get("stopLossQty"))
+                        logger.info(f"Hit stop loss for {symbol} {pnlPercentage} selling {amount}")
+                        await self.runoplive("buy", f"{symbol} -{amount} AMF")
+                        strategyState["start"] = "Z"
+                        return
+
+                    if pnlPercentage > (level.get("takeProfit") *100):
+                        amount =  math.ceil(myPos.position * level.get("takeProfQty"))
+                        logger.info(f"Hit second take profit for {symbol} {pnlPercentage}, selling {amount} ")
+                        await self.runoplive("buy", f"{symbol} -{amount} AMF")
+                        strategyState["start"] = "L2"
+                        return
+
+                if stratState == "L2":
+                    #logger.debug(f"strategy S1 is in state {stratState} {pnlPercentage} {avgCost} {mktPrice}")
+                    trailStop = strategyState.get("highPrice") - (strategyState.get("highPrice") * level.get("stopLoss"))
+
+                    if trailStop <= mktPrice:
+                        amount = myPos.position
+                        logger.info(f"Hit stop loss for {symbol} {pnlPercentage} selling {amount}")
+                        await self.runoplive("buy", f"{symbol} -{amount} AMF")
+                        strategyState["start"] = "Z"
+                        return
+
+                    if not isFuture and untilClose.seconds <= 300 :
+                        amount = myPos.position
+                        logger.info(f"Hit max profit and the contract is going to expire, selling before the close {symbol} {pnlPercentage} selling {amount}")
+                        await self.runoplive("buy", f"{symbol} -{amount} AMF")
+                        strategyState["start"] = "Z"
 
 
 @dataclass
@@ -3151,7 +3212,7 @@ class IOpRunStrategy(IOp):
             strat = globals().get(STRATMAP.get(self.algo))
 
             if strat :
-                logger.info(f"running strategy for {self.symbol} to {strat} starting at {self.start}")
+                #logger.debug(f"running strategy for {self.symbol} to {strat} starting at {self.start}")
                 sinstance = strat(self)
                 await sinstance.run(self.symbol)
             else:
@@ -3168,7 +3229,7 @@ class IOpBuyOptionStrategy1(IOp):
             DArg("direction", convert=lambda x: x.upper(), desc="Puts or Calls", verify=lambda x: x in OPTIONMAP.keys(),),
             DArg("total", convert=lambda x: PriceOrQuantity(x)),
             DArg("dte", convert=int, desc="Days to expiry"),
-            DArg("*preview", desc="Print as a what-if order to show margin impact." ""),
+            #DArg("*preview", desc="Print as a what-if order to show margin impact." ""),
         ]
 
 
@@ -3182,12 +3243,12 @@ class IOpBuyOptionStrategy1(IOp):
             )
             return
 
-        if self.symbol not in OPTIONMAP.keys() and dow != 4 :
+        if self.symbol not in ZDTEMAP.keys() and dow != 4 :
             logger.error(
                 f"This is not an index option and has no 0DTE options, and the DTE specified is not a Friday {dow}"
             )
             return
-        if self.symbol in OPTIONMAP.keys() and dow > 4 :
+        if self.symbol in ZDTEMAP.keys() and dow > 4 :
             logger.error(
                 f"This is an index option but this is an invalid contract Day of Week {dow}"
             )
@@ -3216,278 +3277,281 @@ class IOpBuyOptionStrategy1(IOp):
             else:
                 contract = contractForName(fullSymbol)
 
-        if contract is None:
-            logger.error("Not submitting order because contract can't be formatted!")
-            return None
-
-        if not isinstance(contract, Bag):
-            # spreads are qualified when they are initially populated so we never qualify a bag directly
-            (contract,) = await self.state.qualify(contract)
-
-        isLong = self.total.is_long
-
-        am = ALGOMAP["AMF"]
-
-        # we're double using 'preview' for actual 'preview' and also an optional '@ $33.22' limit price field,
-        # so this is only a true 'preview' if there is only one element here.
-        optionalPrice = 0
-        isPreview = False
-        bracket = None
-
-        if self.preview:
-            # preview is just ["preview"] in self.preview
-            isPreview = len(self.preview) == 1
-
-            pl = len(self.preview)
-            # self.preview can *also* be a list with a limit price where we use syntax of ["@", "33.33"]
-            if pl >= 2:
-                if self.preview[0] != "@":
-                    logger.warning(
-                        "Syntax broken? Expected '@ <price>' but got: {}", self.preview
-                    )
-
-                try:
-                    optionalPrice = float(self.preview[1])
-                except:
-                    logger.error(
-                        "Optional price isn't a number? Failed to read as price: {}",
-                        self.preview[1],
-                    )
-                    return None
-
-                # if we have EVEN MORE ELEMENTS, user is requesting an auto-attached exit too.
-
-                extension = OrderExtension.NONE
-                extensionPriceProfit = None
-                extensionPriceLoss = None
-                if pl >= 4:
-                    try:
-                        extensionPrice = float(self.preview[3])
-                    except:
-                        logger.error(
-                            "Failed to convert exit price: {} from {}",
-                            self.preview[3],
-                            self.preview,
-                        )
-                        return
-
-                    # We want to submit attached orders, but IBKR only allows attacahed orders as either:
-                    #  - dual side braacket orders
-                    #  - trailing stop limit orders
-
-                    # If short, we need to flip the direction of our math and it's easier to just invert here
-                    if not isLong:
-                        extensionPrice *= -1
-
-                    match self.preview[2]:
-                        case "+":
-                            # Create PROFIT exit at +$A.BC
-                            extension = OrderExtension.PROFIT
-                            extensionPriceProfit = optionalPrice + extensionPrice
-                            extensionPriceLoss = max(
-                                optionalPrice - (extensionPrice * 4), 0.05
-                            )
-                            bracket = Bracket(profitLimit=extensionPriceProfit)
-                        case "-":
-                            # Create LOSS exit at -$X.YZ
-                            extension = OrderExtension.LOSS
-                            extensionPriceLoss = optionalPrice - extensionPrice
-                            bracket = Bracket(lossLimit=extensionPriceLoss)
-                            extensionPriceProfit = optionalPrice + (extensionPrice * 4)
-                        case "±":
-                            # Create BRACKET.
-                            # BRACKET can be submitted with the order ALL AT ONCE as a conditional parent tree order.
-                            extension = OrderExtension.BRACKET
-                            extensionPriceLoss = optionalPrice - extensionPrice
-                            extensionPriceProfit = optionalPrice + extensionPrice
-                            bracket = Bracket(
-                                profitLimit=extensionPriceProfit,
-                                lossLimit=extensionPriceLoss,
-                            )
-                        case _:
-                            logger.error(
-                                "Invalid order exit requested? Expected one of +|-|± but got {}",
-                                self.preview[2],
-                            )
-                            return
-
-                # we can *also* optionally append "preview" to the final price for a preview-at-price order like:
-                # buy AAPL 100 AF @ 200.21 preview
-                # (yeah, it's a mess, but it's _our_ mess)
-                if self.preview[-1].lower().startswith("p"):
-                    isPreview = True
-
-        # note: limit=0 causes placeOrderForContract to automatically calculate the quote midpoint as starting offer.
-        placed = await self.state.placeOrderForContract(
-            fullSymbol,
-            isLong,
-            contract,
-            qty=self.total,
-            # if we are buying by AMOUNT, we don't specify a limit price since it will be calculated automatically,
-            # then we read the calculated amount to run the auto-price-tracking attempts.
-            # if we provide a price, it gets used as the limit price directly.
-            limit=optionalPrice,
-            orderType=am,
-            preview=isPreview,
-            bracket=bracket,
-        )
-
-        if isPreview:
-            # Don't continue trying to update the order if this was just a preview request
-            return placed
-
-        if not placed:
-            logger.error("[{}] Order can't continue!", fullSymbol)
-            return False
-
-        # if this is a market order, don't run the algo loop
-        if {
-            "MOO",
-            "MOC",
-            "MKT",
-            "LIT",
-            "MIT",
-            "SLOW",
-            "PEG",
-            "STP",
-            "STOP",
-            "MTL",
-        } & set(am.split()):
-            logger.warning(
-                "Not running price algo because this is a passive or slower resting order..."
-            )
-            return False
-
-        # Also don't run the algo loop if we have a MANUAL price requested:
-        if optionalPrice:
-            logger.warning(
-                "Not running price algo because limit price provided directly..."
-            )
-            return False
-
-        order, trade = placed
-
-        quoteKey = lookupKey(contract)
-
-        checkedTimes = 0
-        # while (unfilled quantity) AND (order NOT canceled or rejected or broken)
-        while (rem := trade.orderStatus.remaining) > 0 or (
-                "Pending" in trade.orderStatus.status
-        ):
-            if ("Cancel" in trade.orderStatus.status) or (
-                    trade.orderStatus.status in {"Filled", "Inactive"}
-            ):
-                logger.error(
-                    "[{} :: {}] Order was canceled or rejected! Status: {}",
-                    trade.orderStatus.status,
-                    trade.contract.localSymbol,
-                    pp.pformat(trade.orderStatus),
-                )
-                return False
-
-            if rem == 0:
-                logger.warning(
-                    "Quantity Remaining is zero, but status is Pending. Waiting for final order status update..."
-                )
-                # sleep 75 ms and check again
-                await asyncio.sleep(0.075)
-                # TODO: infinite looped here? WHAT?
-                continue
-
-            logger.info("Quantity remaining: {:,.2f}", rem)
-            checkedTimes += 1
-
-            # if this is the first check after the order was placed, don't
-            # run the algo (i.e. give the original limit price a chance to work)
-            if checkedTimes == 1:
-                logger.info("Skipping adjust so original limit has a chance to fill...")
-                await asyncio.sleep(0.075)
-                continue
-
-            # get current qty/value of trade both remaining and already executed
-            # TODO: fix these names. these names are bad. "currentQty" is actually "order remaining quantity"
-            (
-                remainingAmount,  # PRICE * Q
-                totalAmount,  # PRICE * Q
-                currentPrice,  # SYMBOL PRICE
-                currentQty,  # REMAINING QUANTITY
-            ) = self.state.amountForTrade(trade)
-
-            # re-read current quote for symbol before each update in case the price is moving rapidly against us
-            bid, ask = self.state.currentQuote(quoteKey)
-
-            if bid > 0 and ask > 0:
-                logger.info("Adjusting price for more aggressive fills...")
-
-                # TODO: restore ability for OPENING ORDERS to reduce quantity when ordering and chasing quotes, but
-                #       remember to DO NOT reduce quantity when chasing closing orders because we want to close a whole position.
-                if isLong:
-                    # if this is a BUY LONG order, we want to close the gap between our initial price guess and the actual ask.
-                    newPrice = (currentPrice + ask) / 2
-                else:
-                    # else, this is a SELL SHORT (or close long) order, so we want to start at our price and chase the bid closer.
-                    newPrice = (currentPrice + bid) / 2
-
-                if isinstance(trade.contract, (Option, FuturesOption, Future)):
-                    newPrice = comply(contract, newPrice)
-
-                # crypto and forex can round to 8 places, everything else is 2 places.
-                if isinstance(trade.contract, (Forex, Crypto)):
-                    newPrice = round(newPrice, 8)
-                else:
-                    newPrice = round(newPrice, 2)
-                    # if price DID NOT CHANGE, we still need to modify the price increment for an order update in our intended direction.
-                    # (there's no sense in updating an order price to the same value, plus IBKR outright rejects updates if the price or quantity doesn't change)
-                    if newPrice == currentPrice:
-                        currentPrice += 0.01 if isLong else -0.01
-
-                logger.info(
-                    "Price changing from {} to {} (difference {}) for spending ${:,.2f}",
-                    currentPrice,
-                    newPrice,
-                    round((newPrice - currentPrice), 4),
-                    totalAmount,
-                )
-
-                if currentPrice == newPrice:
-                    logger.error(
-                        "Not submitting order update because no price change? Order still active!"
-                    )
-                    return False
-
-                logger.info("Submitting order update to: ${:,.2f}", newPrice)
-                order.lmtPrice = newPrice
-
-                self.ib.placeOrder(contract, order)
-
-            waitDuration = 3
-            logger.info(
-                "[{} :: {}] Waiting for {} seconds to check for new executions...",
-                trade.orderStatus.orderId,
-                checkedTimes,
-                waitDuration,
-            )
-
-            try:
-                await asyncio.sleep(waitDuration)
-            except:
-                # catches CTRL-C during sleep
-                logger.warning(
-                    "[{}] User canceled automated limit updates! Order still live.",
-                    trade.orderStatus.orderId,
-                )
-                break
-
-        # now just print current holdings so we have a clean view of what we just transacted
-        # (but schedule it for a next run so so the event loop has a chance to update holdings first)
-        async def delayShowPositions():
-            await asyncio.sleep(0.9626)
-            await self.runoplive("setstrat", f'"{fullSymbol}" "S1" "L0"')
-            await self.runoplive("positions",)
-
-        asyncio.create_task(delayShowPositions())
-
-        # "return True" signals to an algo caller the order is finalized without errors.
+        await self.runoplive("buy", f'{fullSymbol} {self.total} AMF ')
+        await self.runoplive("setstrat", f'"{fullSymbol}" "S1" "L0"')
+        #return False
+        #
+        # if contract is None:
+        #     logger.error("Not submitting order because contract can't be formatted!")
+        #     return None
+        #
+        # if not isinstance(contract, Bag):
+        #     # spreads are qualified when they are initially populated so we never qualify a bag directly
+        #     (contract,) = await self.state.qualify(contract)
+        #
+        # isLong = self.total.is_long
+        #
+        # am = ALGOMAP["AMF"]
+        #
+        # # we're double using 'preview' for actual 'preview' and also an optional '@ $33.22' limit price field,
+        # # so this is only a true 'preview' if there is only one element here.
+        # optionalPrice = 0
+        # isPreview = False
+        # bracket = None
+        #
+        # if self.preview:
+        #     # preview is just ["preview"] in self.preview
+        #     isPreview = len(self.preview) == 1
+        #
+        #     pl = len(self.preview)
+        #     # self.preview can *also* be a list with a limit price where we use syntax of ["@", "33.33"]
+        #     if pl >= 2:
+        #         if self.preview[0] != "@":
+        #             logger.warning(
+        #                 "Syntax broken? Expected '@ <price>' but got: {}", self.preview
+        #             )
+        #
+        #         try:
+        #             optionalPrice = float(self.preview[1])
+        #         except:
+        #             logger.error(
+        #                 "Optional price isn't a number? Failed to read as price: {}",
+        #                 self.preview[1],
+        #             )
+        #             return None
+        #
+        #         # if we have EVEN MORE ELEMENTS, user is requesting an auto-attached exit too.
+        #
+        #         extension = OrderExtension.NONE
+        #         extensionPriceProfit = None
+        #         extensionPriceLoss = None
+        #         if pl >= 4:
+        #             try:
+        #                 extensionPrice = float(self.preview[3])
+        #             except:
+        #                 logger.error(
+        #                     "Failed to convert exit price: {} from {}",
+        #                     self.preview[3],
+        #                     self.preview,
+        #                 )
+        #                 return
+        #
+        #             # We want to submit attached orders, but IBKR only allows attacahed orders as either:
+        #             #  - dual side braacket orders
+        #             #  - trailing stop limit orders
+        #
+        #             # If short, we need to flip the direction of our math and it's easier to just invert here
+        #             if not isLong:
+        #                 extensionPrice *= -1
+        #
+        #             match self.preview[2]:
+        #                 case "+":
+        #                     # Create PROFIT exit at +$A.BC
+        #                     extension = OrderExtension.PROFIT
+        #                     extensionPriceProfit = optionalPrice + extensionPrice
+        #                     extensionPriceLoss = max(
+        #                         optionalPrice - (extensionPrice * 4), 0.05
+        #                     )
+        #                     bracket = Bracket(profitLimit=extensionPriceProfit)
+        #                 case "-":
+        #                     # Create LOSS exit at -$X.YZ
+        #                     extension = OrderExtension.LOSS
+        #                     extensionPriceLoss = optionalPrice - extensionPrice
+        #                     bracket = Bracket(lossLimit=extensionPriceLoss)
+        #                     extensionPriceProfit = optionalPrice + (extensionPrice * 4)
+        #                 case "±":
+        #                     # Create BRACKET.
+        #                     # BRACKET can be submitted with the order ALL AT ONCE as a conditional parent tree order.
+        #                     extension = OrderExtension.BRACKET
+        #                     extensionPriceLoss = optionalPrice - extensionPrice
+        #                     extensionPriceProfit = optionalPrice + extensionPrice
+        #                     bracket = Bracket(
+        #                         profitLimit=extensionPriceProfit,
+        #                         lossLimit=extensionPriceLoss,
+        #                     )
+        #                 case _:
+        #                     logger.error(
+        #                         "Invalid order exit requested? Expected one of +|-|± but got {}",
+        #                         self.preview[2],
+        #                     )
+        #                     return
+        #
+        #         # we can *also* optionally append "preview" to the final price for a preview-at-price order like:
+        #         # buy AAPL 100 AF @ 200.21 preview
+        #         # (yeah, it's a mess, but it's _our_ mess)
+        #         if self.preview[-1].lower().startswith("p"):
+        #             isPreview = True
+        #
+        # # note: limit=0 causes placeOrderForContract to automatically calculate the quote midpoint as starting offer.
+        # placed = await self.state.placeOrderForContract(
+        #     fullSymbol,
+        #     isLong,
+        #     contract,
+        #     qty=self.total,
+        #     # if we are buying by AMOUNT, we don't specify a limit price since it will be calculated automatically,
+        #     # then we read the calculated amount to run the auto-price-tracking attempts.
+        #     # if we provide a price, it gets used as the limit price directly.
+        #     limit=optionalPrice,
+        #     orderType=am,
+        #     preview=isPreview,
+        #     bracket=bracket,
+        # )
+        #
+        # if isPreview:
+        #     # Don't continue trying to update the order if this was just a preview request
+        #     return placed
+        #
+        # if not placed:
+        #     logger.error("[{}] Order can't continue!", fullSymbol)
+        #     return False
+        #
+        # # if this is a market order, don't run the algo loop
+        # if {
+        #     "MOO",
+        #     "MOC",
+        #     "MKT",
+        #     "LIT",
+        #     "MIT",
+        #     "SLOW",
+        #     "PEG",
+        #     "STP",
+        #     "STOP",
+        #     "MTL",
+        # } & set(am.split()):
+        #     logger.warning(
+        #         "Not running price algo because this is a passive or slower resting order..."
+        #     )
+        #     return False
+        #
+        # # Also don't run the algo loop if we have a MANUAL price requested:
+        # if optionalPrice:
+        #     logger.warning(
+        #         "Not running price algo because limit price provided directly..."
+        #     )
+        #     return False
+        #
+        # order, trade = placed
+        #
+        # quoteKey = lookupKey(contract)
+        #
+        # checkedTimes = 0
+        # # while (unfilled quantity) AND (order NOT canceled or rejected or broken)
+        # while (rem := trade.orderStatus.remaining) > 0 or (
+        #         "Pending" in trade.orderStatus.status
+        # ):
+        #     if ("Cancel" in trade.orderStatus.status) or (
+        #             trade.orderStatus.status in {"Filled", "Inactive"}
+        #     ):
+        #         logger.error(
+        #             "[{} :: {}] Order was canceled or rejected! Status: {}",
+        #             trade.orderStatus.status,
+        #             trade.contract.localSymbol,
+        #             pp.pformat(trade.orderStatus),
+        #         )
+        #
+        #
+        #     if rem == 0:
+        #         logger.warning(
+        #             "Quantity Remaining is zero, but status is Pending. Waiting for final order status update..."
+        #         )
+        #         # sleep 75 ms and check again
+        #         await asyncio.sleep(0.075)
+        #         # TODO: infinite looped here? WHAT?
+        #         continue
+        #
+        #     logger.info("Quantity remaining: {:,.2f}", rem)
+        #     checkedTimes += 1
+        #
+        #     # if this is the first check after the order was placed, don't
+        #     # run the algo (i.e. give the original limit price a chance to work)
+        #     if checkedTimes == 1:
+        #         logger.info("Skipping adjust so original limit has a chance to fill...")
+        #         await asyncio.sleep(0.075)
+        #         continue
+        #
+        #     # get current qty/value of trade both remaining and already executed
+        #     # TODO: fix these names. these names are bad. "currentQty" is actually "order remaining quantity"
+        #     (
+        #         remainingAmount,  # PRICE * Q
+        #         totalAmount,  # PRICE * Q
+        #         currentPrice,  # SYMBOL PRICE
+        #         currentQty,  # REMAINING QUANTITY
+        #     ) = self.state.amountForTrade(trade)
+        #
+        #     # re-read current quote for symbol before each update in case the price is moving rapidly against us
+        #     bid, ask = self.state.currentQuote(quoteKey)
+        #
+        #     if bid > 0 and ask > 0:
+        #         logger.info("Adjusting price for more aggressive fills...")
+        #
+        #         # TODO: restore ability for OPENING ORDERS to reduce quantity when ordering and chasing quotes, but
+        #         #       remember to DO NOT reduce quantity when chasing closing orders because we want to close a whole position.
+        #         if isLong:
+        #             # if this is a BUY LONG order, we want to close the gap between our initial price guess and the actual ask.
+        #             newPrice = (currentPrice + ask) / 2
+        #         else:
+        #             # else, this is a SELL SHORT (or close long) order, so we want to start at our price and chase the bid closer.
+        #             newPrice = (currentPrice + bid) / 2
+        #
+        #         if isinstance(trade.contract, (Option, FuturesOption, Future)):
+        #             newPrice = comply(contract, newPrice)
+        #
+        #         # crypto and forex can round to 8 places, everything else is 2 places.
+        #         if isinstance(trade.contract, (Forex, Crypto)):
+        #             newPrice = round(newPrice, 8)
+        #         else:
+        #             newPrice = round(newPrice, 2)
+        #             # if price DID NOT CHANGE, we still need to modify the price increment for an order update in our intended direction.
+        #             # (there's no sense in updating an order price to the same value, plus IBKR outright rejects updates if the price or quantity doesn't change)
+        #             if newPrice == currentPrice:
+        #                 currentPrice += 0.01 if isLong else -0.01
+        #
+        #         logger.info(
+        #             "Price changing from {} to {} (difference {}) for spending ${:,.2f}",
+        #             currentPrice,
+        #             newPrice,
+        #             round((newPrice - currentPrice), 4),
+        #             totalAmount,
+        #         )
+        #
+        #         if currentPrice == newPrice:
+        #             logger.error(
+        #                 "Not submitting order update because no price change? Order still active!"
+        #             )
+        #             return False
+        #
+        #         logger.info("Submitting order update to: ${:,.2f}", newPrice)
+        #         order.lmtPrice = newPrice
+        #
+        #         self.ib.placeOrder(contract, order)
+        #
+        #     waitDuration = 3
+        #     logger.info(
+        #         "[{} :: {}] Waiting for {} seconds to check for new executions...",
+        #         trade.orderStatus.orderId,
+        #         checkedTimes,
+        #         waitDuration,
+        #     )
+        #
+        #     try:
+        #         await asyncio.sleep(waitDuration)
+        #
+        #     except:
+        #         # catches CTRL-C during sleep
+        #         logger.warning(
+        #             "[{}] User canceled automated limit updates! Order still live.",
+        #             trade.orderStatus.orderId,
+        #         )
+        #         break
+        #
+        # # now just print current holdings so we have a clean view of what we just transacted
+        # # (but schedule it for a next run so so the event loop has a chance to update holdings first)
+        # async def delayShowPositions():
+        #     await asyncio.sleep(0.9626)
+        #     await self.runoplive("positions",)
+        #
+        # asyncio.create_task(delayShowPositions())
+        # # "return True" signals to an algo caller the order is finalized without errors.
         return True
 
 @dataclass

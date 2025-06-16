@@ -1872,7 +1872,7 @@ class IBKRCmdlineApp:
                 alg = self.strategy.get(name)
                 algo = alg.get("algo")
                 start = alg.get("start")
-                logger.error(f"running strategy {name} {algo} {start}")
+                #logger.error(f"running strategy {name} {algo} {start}")
                 asyncio.create_task(
                     self.dispatch.runop("runstrat", f'"{name}" "{algo}" "{start}"', self.opstate)
                 )
