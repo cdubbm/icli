@@ -5,6 +5,8 @@ dist/
 cache*/
 icli/hist/
 icli/__pycache__
+store
+*.csv
 
 *.log
 *.json

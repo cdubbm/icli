@@ -3,7 +3,7 @@
 original_print = print
 import asyncio
 import bisect
-import datetime
+from datetime import datetime, timedelta
 import decimal
 import fnmatch  # for glob string matching!
 import locale  # automatic money formatting
@@ -42,6 +42,7 @@ import icli.awwdio as awwdio
 
 import icli.calc
 import icli.orders as orders
+from icli.bar import OHLC5MinTracker
 
 from icli.futsexchanges import FUTS_EXCHANGE
 
@@ -481,7 +482,6 @@ futures = [
 
 # logger.info("futures are: {}", futures)
 
-
 @dataclass
 class IBKRCmdlineApp:
     # Your IBKR Account ID (required)
@@ -536,6 +536,7 @@ class IBKRCmdlineApp:
     pnlSingle: dict[int, PnLSingle] = field(default_factory=dict)
     exiting: bool = False
     strategy: dict[str, dict] = field(default_factory=dict)
+    barState: dict[str, OHLC5MinTracker] = field(default_factory=dict)
 
     ol: buylang.OLang = field(default_factory=buylang.OLang)
     quotehistory: dict[int, deque[float]] = field(
@@ -1055,7 +1056,9 @@ class IBKRCmdlineApp:
         #  - also, if this is a preview (with or without a limit price), we calculate a price for margin calculations.
         #  - basically: guard against quantity orders attempting to lookup prices when they aren't needed.
         #    (market orders also imply quantity is NOT money because a market order with no quantity doesn't make sense)
-        if (not limit and "MKT" not in orderType) or preview:
+        #logger.error(f"CHAD CHAD CHAD {limit} {orderType} {preview}")
+        #if (not limit and "MKT" not in orderType) or preview:
+        if (not limit ) or preview:
             quoteKey = lang.lookupKey(contract)
 
             # if this is a new quote just requested, we may need to wait
@@ -1867,15 +1870,24 @@ class IBKRCmdlineApp:
                 quotekey = c.conId
 
             self.quotehistory[quotekey].append(price)
+
             # CHAD tickersUpdate
             if self.strategy.get(name):
                 alg = self.strategy.get(name)
                 algo = alg.get("algo")
                 start = alg.get("start")
-                #logger.error(f"running strategy {name} {algo} {start}")
+                if name not in self.barState.keys():
+                    barData = OHLC5MinTracker()
+                    self.barState[name] = barData
+
+                barData = self.barState.get(name)
+                if c.secType == 'OPT':
+                    barData.update(datetime.datetime.now(), self.quoteState.get(name).modelGreeks.undPrice)
+
                 asyncio.create_task(
                     self.dispatch.runop("runstrat", f'"{name}" "{algo}" "{start}"', self.opstate)
                 )
+
 
             # this is a synthetic memory-having ATR where we just feed it price data and
             # it calculates a dynamic H/L/C for the actual ATR based on recent price history.
@@ -2375,9 +2387,13 @@ class IBKRCmdlineApp:
                 underlyingStrikeDifference = None
                 iv = None
                 delta = None
+                gamma = None
+                theta = None
                 try:
                     iv = c.modelGreeks.impliedVol
                     delta = c.modelGreeks.delta
+                    theta = c.modelGreeks.theta
+                    gamma = c.modelGreeks.gamma
 
                     # Note: keep underlyingStrikeDifference the LAST attempt here because if the user doesn't
                     #       have live market data for this option, then 'und' is 0 and this math breaks,
@@ -2600,6 +2616,8 @@ class IBKRCmdlineApp:
                             f"[u {und or 0:>8,.2f} ({itm:<1} {underlyingStrikeDifference or np.nan:>7,.2f}%)]",
                             f"[iv {iv or 0:.2f}]",
                             f"[d {delta or 0:>5.2f}]",
+                            f"[g {gamma or 0:>5.2f}]",
+                            f"[t {theta or 0:>5.2f}]",
                             f"{fmtPriceOpt(e100):>6}",
                             f"{trend}",
                             f"{fmtPriceOpt(e300):>6}",
@@ -2910,6 +2928,7 @@ class IBKRCmdlineApp:
         if symkey not in self.quoteState:
             # logger.info("[{}] Adding new live quote...", symkey)
             self.quoteState[symkey] = self.ib.reqMktData(contract, tickFields)
+            #self.ib.reqHistoricalData()
             self.contractIdsToQuoteKeysMappings[contract.conId] = symkey
 
             # This is a nice debug helper just showing the quote key name to the attached contract subscription:
@@ -3437,3 +3456,5 @@ class IBKRCmdlineApp:
 
     async def setup(self):
         pass
+
+

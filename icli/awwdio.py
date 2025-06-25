@@ -8,7 +8,7 @@ import httpx
 # (and if the server isn't online, we want to drop requests immediately instead of lagging/retrying forever)
 httpxtimeout = httpx.Timeout(0.333, connect=0.333, write=0.333, read=None)
 
-ICLI_AWWDIO_URL = os.getenv("ICLI_AWWDIO_URL", None)
+ICLI_AWWDIO_URL = os.getenv("ICLI_AWWDIO_URL", "http://127.0.0.1:8000")
 
 
 @dataclass
@@ -20,9 +20,10 @@ class AwwdioClient:
     )
 
     async def say(
-        self, voice: str = "Alex", say: str = "Hello World", speed: int = 250
+        self, voice: str = "Daniel", say: str = "Hello World", speed: int = 190
     ) -> None:
         try:
+            logger.info(f"{self.url}/say")
             await self.client.get(
                 f"{self.url}/say", params=dict(voice=voice, say=say, speed=speed)
             )
