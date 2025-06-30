@@ -13,7 +13,7 @@ from dotenv import dotenv_values
 CONFIG_DEFAULT = dict(
     ICLI_IBKR_HOST="127.0.0.1", ICLI_IBKR_PORT=4001, ICLI_REFRESH=3.33
 )
-CONFIG = {**CONFIG_DEFAULT, **dotenv_values(".env.icli"), **os.environ}
+CONFIG = {**CONFIG_DEFAULT, **dotenv_values("../.env.icli"), **os.environ}
 
 # Create the bot
 API_KEY: str = CONFIG["POLYGON_API_KEY"]
@@ -104,9 +104,9 @@ def detect_orb_signal(df_day):
     for i in range(1, len(df_day)):
         candle = df_day.iloc[i]
         if candle["open"] > high and candle["close"] > high:
-            return ("CALL", candle.name, high, low)
+            return ("CALL", candle.name, candle.high, candle.low)
         elif candle["open"] < low and candle["close"] < low:
-            return ("PUT", candle.name, high, low)
+            return ("PUT", candle.name, candle.high, candle.low)
     return None
 
 def get_options_chain(symbol, date):
@@ -155,7 +155,7 @@ def get_option_5min_bars(option_ticker, date):
     df.to_pickle(file)
     return df
 
-def simulate_trade(contracts_total, option_df, stock_df, entry_time, entry_price, direction, day_high, day_low):
+def simulate_trade(contracts_total, option_df, stock_df, entry_time, entry_price, direction, entry_high, entry_low):
     contracts_remaining = contracts_total
     contract_multiplier = 100
     state = "L0"
@@ -168,14 +168,14 @@ def simulate_trade(contracts_total, option_df, stock_df, entry_time, entry_price
         # print (frame.keys())
         # print("%s %f %f %f %f %f %f %f %f" % (time, frame['open'], frame['high'], frame['low'], frame['close'], row['open'], row['high'], row['low'], row['close']))
         if prevrow is not None :
-            if ((direction == 'CALL' and prevrow["close"] < day_high and prevrow["open"] < day_high) or (price < entry_price *.8)) and state=="L0":
+            if ((direction == 'CALL' and prevrow["close"] < entry_low and prevrow["open"] < entry_low) or (price < entry_price *.8)) and state=="L0":
                 cost = entry_price * contracts_remaining
                 soldmkt = price * contracts_remaining
                 log.append((time, 'stock SL', price, contracts_remaining, 0, soldmkt, cost, soldmkt - cost))
                 contracts_remaining = 0
                 state = "Z"
                 break
-            elif ((direction == 'PUT' and prevrow["close"] > day_low and prevrow["open"] > day_low) or (price < entry_price *.8)) and state=="L0":
+            elif ((direction == 'PUT' and prevrow["close"] > entry_high and prevrow["open"] > entry_high) or (price < entry_price *.8)) and state=="L0":
                 cost = entry_price * contracts_remaining
                 soldmkt = price * contracts_remaining
                 log.append((time, 'stock SL', price, contracts_remaining, 0, soldmkt, cost, soldmkt - cost))
@@ -231,7 +231,7 @@ def simulate_trade(contracts_total, option_df, stock_df, entry_time, entry_price
 if __name__ == '__main__':
     symbol = "SPY"
     from_date = datetime.today() - timedelta(days=30)
-    to_date = datetime.today() - timedelta(days=4)
+    to_date = datetime.today() - timedelta(days=2)
 
     df_stock = get_stock_5min_bars(symbol, from_date, to_date)
     total = 0.0
@@ -252,8 +252,8 @@ if __name__ == '__main__':
 
         signal = detect_orb_signal(stock_day)
         if signal:
-            direction, entry_time, high, low = signal
-            # print(f"ORB Signal: {direction} at {entry_time}")
+            direction, entry_time, entry_high, entry_low = signal
+            print(f"ORB Signal: {direction} at {entry_time} {entry_high} {entry_low}")
 
             option_chain = get_options_chain(symbol, trade_date)
             open_price = stock_day.iloc[0]['open']
@@ -261,7 +261,7 @@ if __name__ == '__main__':
 
             strikes = sorted(set(opt['strike_price'] for opt in option_chain))
             nearest_strike = min(strikes, key=lambda x: abs(x - open_price))
-            strike_range = [s for s in strikes if abs(s - nearest_strike) <= 10]
+            strike_range = [s for s in strikes if abs(s - nearest_strike) <= 16]
             # print (strike_range)
             filtered_options = [
                 opt for opt in option_chain
@@ -270,6 +270,8 @@ if __name__ == '__main__':
             ]
 
             if filtered_options:
+                # print(f"FO ORB Signal: {direction} at {entry_time} {entry_high} {entry_low}")
+
                 for fo in filtered_options:
                     sample_ticker = fo['ticker']
                     df_option = get_option_5min_bars(sample_ticker, trade_date)
@@ -280,12 +282,13 @@ if __name__ == '__main__':
                         if not entry_match.empty:
                             actual_entry_time = entry_match[0]
                             entry_price = df_option.loc[actual_entry_time]['close']
-                            if (entry_price > 0.60 or entry_price < 0.40) :
+                            # print(f"{entry_price} {fo}")
+                            if (entry_price > 0.80 or entry_price < 0.30) :
                                 continue
                             size = 100
                             ohigh = max(stock_day.iloc[0]["open"],  stock_day.iloc[0]["close"])
                             olow = min(stock_day.iloc[0]["open"],  stock_day.iloc[0]["close"])
-                            log = simulate_trade(size, df_option, stock_day, actual_entry_time, entry_price, direction, ohigh, olow)
+                            log = simulate_trade(size, df_option, stock_day, actual_entry_time, entry_price, direction, entry_high, entry_low)
                             #print(log)
                             pnl = sum((event[7]) * 100 for event in log)
                             print(f"Simulated trade on {sample_ticker}: {entry_price} {actual_entry_time} Cost = {size * 100 * entry_price} PnL = ${pnl:.2f} ")

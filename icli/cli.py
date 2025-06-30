@@ -1883,7 +1883,6 @@ class IBKRCmdlineApp:
                 barData = self.barState.get(name)
                 if c.secType == 'OPT':
                     barData.update(datetime.datetime.now(), self.quoteState.get(name).modelGreeks.undPrice)
-
                 asyncio.create_task(
                     self.dispatch.runop("runstrat", f'"{name}" "{algo}" "{start}"', self.opstate)
                 )
@@ -2076,8 +2075,9 @@ class IBKRCmdlineApp:
 
             MIN_1 = 60 // refresh
             MIN_3 = (60 * 3) // refresh
+            MIN_5 = (60 * 5) // refresh
 
-            for name, back in (("1m", MIN_1), ("3m", MIN_3)):
+            for name, back in (("1m", MIN_1), ("3m", MIN_3), ("5m", MIN_5)):
                 prev = self.ema[sym][name]
 
                 # use previous price or initialize with current price

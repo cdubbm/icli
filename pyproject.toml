@@ -41,6 +41,9 @@ beautifulsoup4 = "^4.9.3"
 tradeapis = { git = "https://github.com/mattsta/tradeapis.git", tag="2.4.2" }
 schedule = "^1.1.0"
 httpx = "^0.25.2"
+requests = "^2.32.4"
+discord = "^2.3.2"
+selfcord = "^0.2.5"
 
 [tool.poetry.scripts]
 icli = "icli.__main__:runit"

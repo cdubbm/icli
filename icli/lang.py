@@ -13,6 +13,7 @@ import pathlib
 
 import sys
 from collections import Counter, defaultdict
+from zoneinfo import ZoneInfo
 
 import mutil.dispatch
 import mutil.expand
@@ -117,6 +118,7 @@ ALGOMAP = dict(
 
 STRATMAP = dict(
     S1="IOpStrat1",
+    S2="IOpBuyORBStrategy1",
 )
 
 OPTIONMAP = dict(
@@ -135,6 +137,10 @@ STRATSTATEMAP = dict(
     L1="TP1 hit waiting on PT1",
     L2="TP2 hit waiting on runners",
     Z="Finished - cleanup",
+    S="ORB Starting",
+    O="Openrange found",
+    B="Breakout and order placed, sub is running"
+
 )
 
 # This is a little redundant since it's also configured in cli.py.
@@ -3034,6 +3040,10 @@ class IOpStrat1(IOp):
             DArg("symbol", convert=lambda x: x.upper()),
         ]
 
+    def updateParent(self, parentSymbol, subState):
+        if parentSymbol in self.state.strategy:
+            self.state.strategy["subState"] = subState
+
     async def run(self, symbol):
         self.state = self.state.state
         levels = {
@@ -3058,7 +3068,11 @@ class IOpStrat1(IOp):
                 myPos = o
                 break
 
-        if f:
+        if not f:
+            self.state.strategy.pop(symbol, None)
+            return
+
+        else:
             strategyState = self.state.strategy.get(symbol)
             if strategyState.get("lock") :
                 # logger.info("strategy is locked, cannot continue")
@@ -3119,6 +3133,7 @@ class IOpStrat1(IOp):
                             await self.runoplive("say", f"first stop loss reached on  {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
                         strategyState["start"] = "Z"
                         strategyState["lock"] = False
+                        self.updateParent(myPos.contract.tradingClass,"SL0")
                         return
 
                     # logger.error(f"prev: {bar.previous_bar} this: {bar.current_bar}")
@@ -3138,6 +3153,7 @@ class IOpStrat1(IOp):
                             await self.runoplive("say", f"first stop loss reached on {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
                         strategyState["start"] = "Z"
                         strategyState["lock"] = False
+                        self.updateParent(myPos.contract.tradingClass, "SL0")
                         return
 
                     if pnlPercentage > (level.get("takeProfit") *100):
@@ -3148,6 +3164,7 @@ class IOpStrat1(IOp):
                             await self.runoplive("say", f"took first profit on {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
                         strategyState["start"] = "L1"
                         strategyState["lock"] = False
+                        self.updateParent(myPos.contract.tradingClass, "TP1")
                         return
 
                 if stratState == "L1" :
@@ -3161,6 +3178,7 @@ class IOpStrat1(IOp):
                             await self.runoplive("say", f"second stop loss reached on  {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
                         strategyState["start"] = "Z"
                         strategyState["lock"] = False
+                        self.updateParent(myPos.contract.tradingClass, "SL1")
                         return
 
                     if pnlPercentage > (level.get("takeProfit") *100):
@@ -3171,6 +3189,7 @@ class IOpStrat1(IOp):
                             await self.runoplive("say", f"took additional profit {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
                         strategyState["start"] = "L2"
                         strategyState["lock"] = False
+                        self.updateParent(myPos.contract.tradingClass, "TP2")
                         return
 
                 if stratState == "L2":
@@ -3185,6 +3204,7 @@ class IOpStrat1(IOp):
                             await self.runoplive("say", f"runner stop loss reached {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
                         strategyState["start"] = "Z"
                         strategyState["lock"] = False
+                        self.updateParent(myPos.contract.tradingClass, "SLR")
                         return
 
                 if not isFuture and untilClose.seconds <= 300 :
@@ -3195,9 +3215,11 @@ class IOpStrat1(IOp):
                         await self.runoplive("say", f"runners took profit {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
                     strategyState["start"] = "Z"
                     strategyState["lock"] = False
+                    self.updateParent(myPos.contract.tradingClass, "TPR")
                     return
 
                 strategyState["lock"] = False
+                self.updateParent(myPos.contract.tradingClass, "W")
                 return
 
 @dataclass
@@ -3241,7 +3263,7 @@ class IOpSetStrategy(IOp):
 
             logger.info(f"setting strategy for {self.symbol} to {self.algo} starting at {self.start} {strat}")
         else :
-            logger.error(f"FAILED to set strategy for {self.symbol} to {self.algo} starting at {self.start}")
+            self.state.strategy[self.symbol] = {"algo": self.algo, "start": self.start,}
 
 @dataclass
 class IOpRunStrategy(IOp):
@@ -3271,15 +3293,14 @@ class IOpRunStrategy(IOp):
                 f = True
                 break
 
-        if f :
-            strat = globals().get(STRATMAP.get(self.algo))
+        strat = globals().get(STRATMAP.get(self.algo))
 
-            if strat :
-                #logger.debug(f"running strategy for {self.symbol} to {strat} starting at {self.start}")
-                sinstance = strat(self)
-                await sinstance.run(self.symbol)
-            else:
-                logger.error(f"FAILED to RUN strategy for {self.symbol} to {strat} starting at {self.start}")
+        if strat :
+            #logger.debug(f"running strategy for {self.symbol} to {strat} starting at {self.start}")
+            sinstance = strat(self)
+            await sinstance.run(self.symbol)
+        else:
+            logger.error(f"FAILED to RUN strategy for {self.symbol} to {strat} starting at {self.start}")
 
 
 @dataclass
@@ -3287,16 +3308,26 @@ class IOpBuyORBStrategy1(IOp):
     def argmap(self):
         return [
             DArg("symbol", convert=lambda x: x.upper()),
-            DArg("strike", convert=float, desc="Strike to buy"),
-            DArg("direction", convert=lambda x: x.upper(), desc="Puts or Calls", verify=lambda x: x in OPTIONMAP.keys(),),
-            DArg("total",),
-            DArg("dte", convert=int, desc="Days to expiry"),
+            # DArg(
+            #     "start",
+            #     verify=lambda x: x in STRATSTATEMAP.keys(),
+            #     errmsg=f"Available algos: {pp.pformat(STRATSTATEMAP)}",
+            # ),
         ]
 
+    def alignedtime(self, dt):
+        floored_minute = dt.minute - (dt.minute % 5)
+        return dt.replace(minute=floored_minute, second=0, microsecond=0)
 
-    async def run(self) -> bool:
+    def days_until_friday(self, dt):
+        today = datetime.dt.weekday()  # Monday=0, ..., Sunday=6
+        return (4 - today) % 7
+
+    async def getChains(self, symbol, dte, width, direction) -> (str,float):
         today = datetime.date.today()
-        contractDate = today+datetime.timedelta(days=self.dte)
+        contractDate = today + datetime.timedelta(days=dte)
+        contractDateNum = "%2d%02d%02d" % (contractDate.year - 2000, contractDate.month, contractDate.day)
+
         dow = contractDate.weekday()
         if dow < 0:
             logger.error(
@@ -3304,47 +3335,337 @@ class IOpBuyORBStrategy1(IOp):
             )
             return
 
-        if self.symbol not in ZDTEMAP.keys() and dow != 4 :
+        if symbol not in ZDTEMAP.keys() and dow != 4:
             logger.error(
                 f"This is not an index option and has no 0DTE options, and the DTE specified is not a Friday {dow}"
             )
             return
-        if self.symbol in ZDTEMAP.keys() and dow > 4 :
+        if symbol in ZDTEMAP.keys() and dow > 4:
             logger.error(
                 f"This is an index option but this is an invalid contract Day of Week {dow}"
             )
             return
 
-        strikeFmt = str(int(self.strike * 1000)).zfill(8)
-        fullSymbol = "%s%2d%02d%02d%c%s" % (self.symbol, contractDate.year-2000,contractDate.month, contractDate.day, self.direction, strikeFmt )
-        logger.info(f"things are ok {self.symbol} {self.dte} {self.direction} {self.strike} {self.total} {contractDate} {fullSymbol}")
+        # verify we have quotes enabled to get the current price...
+        await self.runoplive("add", f'"{symbol}"')
 
+        datestrikes = await self.runoplive(
+            "chains",
+            symbol,
+        )
+
+        # TODO: what about ranges where we do'nt have an underlying like NDXP doesn't mean we are subscribed to ^NDX
+        quote = self.state.quoteState[symbol]
+
+        # prices are NaN until they get populated...
+        # (and sometimes this doesn't work right after hours or weekend times... thanks ibkr)
+        # TODO: we could _also_ check the bid/ask spread if the prices aren't populating.
+        while (quote.last != quote.last) or (quote.close != quote.close):
+            logger.info("[{}] Waiting for price to populate...", symbol)
+            await asyncio.sleep(0.25)
+
+        # this is a weird way of masking out all NaN values leaving only the good values, so we select
+        # the first non-NaN value in this order here...
+        fetchone = np.array([quote.last, quote.close])
+        currentPrice = fetchone[np.isfinite(fetchone)][0]
+
+        low = currentPrice - width
+        high = currentPrice + width
+        logger.info(
+            "[{} :: {}] Providing option chain range between [{}, {}] using current price {:,.2f}",
+            symbol,
+            width,
+            low,
+            high,
+            currentPrice,
+        )
+
+        # TODO: for same-day expiry, we should be checking if the time of 'now' is >= (16, 15) and then use the next chain date instead.
+        # Currently, if you request 'range' for daily options at like 5pm, it still gives you the same-day already expired options.
+        now = pendulum.now("US/Eastern")
+        today = str(now.date()).replace("-", "")
+        generated = []
+
+        # we need to sort by the date values since the IBKR API returns dates in a random order...
+        for date, strikes in sorted(
+                datestrikes[symbol].items(), key=lambda x: x[0]
+        ):
+            # don't generate strikes in the past...
+            if date < today or date > contractDateNum:
+                logger.warning("[{}] Skipping date is not desired...", date)
+                continue
+
+            logger.info("[{}] Using date as basis for strike generation...", date)
+            for strike in strikes:
+                if low < strike < high:
+                    for pc in (direction,):
+                        optionSymbol = "{}{}{}{:0>8}".format(
+                            symbol,
+                            date[2:],
+                            pc,
+                            int(strike * 1000),
+                        )
+                        logger.info(f"{optionSymbol}")
+                        contracts = [contractForName(optionSymbol)]
+                        contracts = await self.state.qualify(*contracts)
+
+                        for contract in contracts:
+                            data = self.ib.reqMktData(
+                                contract,
+                                tickFieldsForContract(contract),
+                            )
+                            #logger.info(data)
+                            await self.runoplive("add", f'"{optionSymbol}"')
+                            await asyncio.sleep(0.25)
+                            bid, ask=self.state.currentQuote(optionSymbol)
+                            if (bid+ask)/2 > 0.29 and (bid+ask)/2 < 0.80:
+                                return (optionSymbol,contract.strike)
+                            await self.runoplive("rm", f'"{optionSymbol}"')
+                            await asyncio.sleep(0.25)
+                        generated.append(optionSymbol)
+
+            # only print for THE FIRST DATE FOUND
+            # (so we don't end up writing these out for every daily expiration or
+            #  an entire month of expirations, etc)
+            break
+
+        for row in generated:
+            logger.info("Got: {}", row)
+
+        out = f"strikes-{symbol}.txt"
+        pathlib.Path(out).write_text("\n".join(generated) + "\n")
+
+        logger.info("[{} :: {}] Saved strikes to: {}", symbol, width, out)
+        return None,0.0
+
+    async def run(self, symbol):
+        self.state = self.state.state
         contract = None
+        debug = False
+        opendate = None
+        opentime = None
 
-        if " " in fullSymbol:
+        curState = None
+        if symbol in self.state.strategy:
+            curState = self.state.strategy.get(symbol)
+        else:
+            self.state.strategy[symbol] = {"start":"S", "desc" : "waiting for opening range", "algo" : "S2", "entries":0, "lastCheckTime": datetime.datetime(2025,6,26,9,29,tzinfo=ZoneInfo("America/New_York")) if debug else datetime.datetime.now()} #TODO: this needs to be set to now
+            logger.info(f"set ORB strategy for symbol : {self.state.strategy}")
+            return True
+
+        if debug :
+            opendate = datetime.date(2025,6,26) #TODO: this needs to be fixed to the current date.
+        else:
+            opendate = datetime.datetime.now().date()
+
+        opentime = datetime.time(9,30,0,0,tzinfo=ZoneInfo("America/New_York"))
+        curtime = datetime.datetime.now(tz=ZoneInfo("America/New_York"))
+        if 'lastCheckTime' not in self.state.strategy[symbol]:
+            self.state.strategy[symbol]['lastCheckTime'] = curtime
+
+        lasttime = self.state.strategy[symbol]['lastCheckTime']
+
+        if debug:
+            curtime = self.state.strategy[symbol]['lastCheckTime'] + datetime.timedelta(seconds=300)
+
+        self.state.strategy[symbol]['lastCheckTime'] = curtime
+
+        if " " in symbol:
             # is multi-leg spread/bag request, so do bag
-            orderReq = self.state.ol.parse(fullSymbol)
+            orderReq = self.state.ol.parse(symbol)
             contract = await self.state.bagForSpread(orderReq)
         else:
             # else, is a regular single symbol
             # if ordering current positional quote, do the lookup.
             # TODO: make centralized lookup helper function
-            if fullSymbol.startswith(":"):
-                orig = fullSymbol
-                fullSymbol, contract = self.state.quoteResolve(fullSymbol)
+            if symbol.startswith(":"):
+                orig = sybmol
+                fullSymbol, contract = self.state.quoteResolve(symbol)
                 if not fullSymbol:
                     logger.error("[{}] Failed to find symbol by position index!", orig)
                     return None
             else:
-                contract = contractForName(fullSymbol)
+                contract = contractForName(symbol)
 
-        await self.runoplive("buy", f'{fullSymbol} {self.total} AMF ')
-        await asyncio.sleep(4)
-        extra = " ".join(self.extras)
-        await self.runoplive("setstrat", f'"{fullSymbol}" "S1" "L0" {extra}')
-        return True
+        quote: Ticker = self.state.quoteState.get(symbol)
 
+        if quote is None:
+            logger.info(f"no quote avaiable for {self.symbol} getting it")
+            await self.runoplive("add", f'"{self.symbol}"')
 
+        if curState["start"] == "S":
+            if self.alignedtime(curtime) <= self.alignedtime(lasttime):
+                return
+
+            contract = Stock(symbol, 'SMART', 'USD')
+            # logger.debug(f"Just before requesting the bars {curState}")
+
+            bars = await self.ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime=curtime,
+                durationStr='23400 S',  # Go back 2 days from now
+                barSizeSetting='5 mins',  # 5-minute candles
+                whatToShow='TRADES',
+                useRTH=True,
+                formatDate=1
+            )
+            openBarFound = False
+            for bar in bars:
+                if bar.date == datetime.datetime.combine(opendate, opentime):
+                    curState["orbHigh"] = bar.high
+                    curState["orbLow"] = bar.low
+                    curState["orbTime"] = bar.date
+                    curState["start"] = "O"
+                    curState["desc"] = "opening range set, waiting for breakout"
+                    openBarFound = True
+                    # logger.debug(curState)
+                    break
+
+            if not openBarFound:
+                if bar.date < datetime.datetime.combine(opendate, opentime):
+                    # logger.debug("not yet received an opening candle")
+                    return
+
+            # curState["orbHigh"] = bar.high
+            # curState["orbLow"] = bar.low
+            # curState["state"] = "O"
+            # curState["desc"] = "opening range set, waiting for breakout"
+
+        if curState["start"] == "O":
+            if self.alignedtime(curtime) <= self.alignedtime(lasttime):
+                return
+
+            bars = await self.ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime=curtime,
+                durationStr='23400 S',  # Go back 2 days from now
+                barSizeSetting='5 mins',  # 5-minute candles
+                whatToShow='TRADES',
+                useRTH=True,
+                formatDate=1
+            )
+
+            bar = None
+            breakoutFound = False
+            stale = False
+            inside = True
+            outside = False
+            direction = None
+            breakoutCount = 0
+            retestCount = 0
+            outsideCount = 0
+            for bar in bars:
+                # logger.info(
+                #     f"PRE LOOP breakout for {symbol} -> direction={direction} @ {bar.date} count={breakoutCount} retest={retestCount} outcount={outsideCount} {stale} {inside} {outside}")
+
+                if bar.date < datetime.datetime.combine(opendate, opentime):
+                    continue
+                orbHigh = curState["orbHigh"]
+                orbLow = curState["orbLow"]
+                # logger.info(f"{bar.date} == {self.alignedtime(curtime-datetime.timedelta(seconds=300))}")
+                if bar.open > curState["orbHigh"] and bar.close > curState["orbHigh"]:
+                    outside = True
+                    inside = False
+                    if not stale:
+                        outsideCount += 1
+                        if bar.date == self.alignedtime(curtime-datetime.timedelta(seconds=300)):
+                            breakoutCount += 1
+                            direction="P"
+                            breakoutFound = True
+                            inside = False
+                            break
+                        else:
+                            stale = True
+                            # logger.info("stale breakout found")
+
+                elif bar.open < curState["orbLow"] and bar.close < curState["orbLow"]:
+                    outside = True
+                    inside = False
+                    if not stale:
+                        outsideCount += 1
+                        if bar.date == self.alignedtime(curtime-datetime.timedelta(seconds=300)):
+                            breakoutCount += 1
+                            direction="P"
+                            breakoutFound = True
+                            inside = False
+                            break
+                        else:
+                            stale = True
+                            # logger.info("stale breakout found")
+
+                elif not inside:
+                    inside = True
+                    stale = False
+                    retestCount += 1
+                    outside = False
+                #
+                # logger.info(
+                #     f"POS LOOP breakout for {symbol} -> direction={direction} @ {bar.date} count={breakoutCount} retest={retestCount} outcount={outsideCount} {stale} {inside} {outside}")
+                # logger.debug(f"found breakout at bar {bar}, {breakoutFound} {direction}")
+
+            #TODO: remove this extra True and the direction is fixed to P
+            if breakoutFound:
+                amount = 1000
+                dte = 0
+                if symbol not in ZDTEMAP:
+                    dte = self.days_until_friday(curtime)
+                sl = 0
+                if direction == "P" :
+                    sl = bar.high
+                else:
+                    sl = bar.low
+
+                optionToTrade, strike = await self.getChains(symbol,0,5, direction)
+
+                await self.runoplive("bo1", f'{symbol} {strike} {direction} ${amount} {dte} SL:{sl}')
+
+                curState["option"] = optionToTrade
+                curState["breakoutFound"] = True
+                curState["breakoutDirection"] = direction
+                curState["breakoutTime"] = bar.date
+                curState["start"] = "B"
+                curState["desc"] = "trade placed, waiting for results"
+                if "entries" in curState:
+                    curState["entries"] += 1
+                else:
+                    curState["entries"] = 1
+
+        if curState["start"] == "B":
+            option = curState["option"]
+            fromSub = None
+            if "subState" in curState:
+                fromSub = curState["subState"]
+
+            subState = None
+            if option in self.state.strategy:
+                subState = self.state.strategy[option]
+
+            logger.info(f"waiting on substrategy to complete {option} {fromSub} {subState}")
+
+            if (fromSub== "SL1" or fromSub== "SL0") and curState["entries"] < 3 :
+                logger.info(f"substrategy for {option} hit state {fromSub}, setting up re-entry")
+                curState["start"] = "O"
+            elif fromSub== "SLR" or fromSub== "TPR":
+                curState["start"] = "Z"
+
+        if curState["start"] == "Z":
+            self.state.strategy.pop(symbol)
+
+        #await self.runoplive("buy", f'{fullSymbol} {self.total} AMF ')
+        #await asyncio.sleep(4)
+        #extra = " ".join(self.extras)
+        #await self.runoplive("setstrat", f'"{fullSymbol}" "S1" "L0" {extra}')
+        return
+
+@dataclass
+class IOpShowStrats(IOp):
+    def argmap(self):
+        return [
+
+        ]
+    async def run(self) -> bool:
+            logger.info(f"Strategies in memory: {self.state.strategy}")
+            return True
 
 @dataclass
 class IOpBuyOptionStrategy1(IOp):
@@ -3417,28 +3738,28 @@ class IOpBuyOptionStrategy1(IOp):
                     previewSet = True
                     preview = extra
 
-        if not slSet:
-            underlying = contract.tradingClass
-            contract = Stock(underlying, 'SMART', 'USD')
-
-            # ib = IB()
-            # ib.connect('127.0.0.1', 4001, clientId=1123)
-            # Request historical bars
-            bars = await self.ib.reqHistoricalDataAsync(
-                contract,
-                endDateTime='',
-                durationStr='1 D',  # Go back 2 days from now
-                barSizeSetting='5 mins',  # 5-minute candles
-                whatToShow='TRADES',
-                useRTH=True,
-                formatDate=1
-            )
-
-            bar : BarData = bars[0]
-            if self.direction == "C":
-                self.extras.append(f"SL:{bar.high}")
-            elif self.direction == "P":
-                self.extras.append(f"SL:{bar.low}")
+        # if not slSet:
+        #     underlying = contract.tradingClass
+        #     contract = Stock(underlying, 'SMART', 'USD')
+        #
+        #     # ib = IB()
+        #     # ib.connect('127.0.0.1', 4001, clientId=1123)
+        #     # Request historical bars
+        #     bars = await self.ib.reqHistoricalDataAsync(
+        #         contract,
+        #         endDateTime='',
+        #         durationStr='1 D',  # Go back 2 days from now
+        #         barSizeSetting='5 mins',  # 5-minute candles
+        #         whatToShow='TRADES',
+        #         useRTH=True,
+        #         formatDate=1
+        #     )
+        #
+        #     bar : BarData = bars[0]
+        #     if self.direction == "C":
+        #         self.extras.append(f"SL:{bar.high}")
+        #     elif self.direction == "P":
+        #         self.extras.append(f"SL:{bar.low}")
 
         await self.runoplive("buy", f'{fullSymbol} {self.total} AMF {preview} ')
         await asyncio.sleep(4)
@@ -4491,6 +4812,126 @@ class IOpOrderSpread(IOp):
         trade = self.ib.placeOrder(bag, order)
         logger.info("TRADE EXECUTED: {}", pp.pformat(trade))
 
+@dataclass
+class IOpOptionChainRangeDTE(IOp):
+    """Print OCC symbols for an underlying with ± offset for puts and calls."""
+
+    def argmap(self):
+        # TODO: add options to allow multiple symbols and also printing cached chains
+        return [
+            DArg("symbol", convert=lambda x: x.upper()),
+            DArg("width", convert=lambda x: float(x)),
+            DArg("dte", convert=lambda x: int(x)),
+        ]
+
+    async def run(self):
+        today = datetime.date.today()
+        contractDate = today+datetime.timedelta(days=self.dte)
+        contractDateNum = "%2d%02d%02d" % (contractDate.year-2000,contractDate.month, contractDate.day )
+
+        dow = contractDate.weekday()
+        if dow < 0:
+            logger.error(
+                f"You cannot specify contracts with expirations in the past, we live in the present"
+            )
+            return
+
+        if self.symbol not in ZDTEMAP.keys() and dow != 4 :
+            logger.error(
+                f"This is not an index option and has no 0DTE options, and the DTE specified is not a Friday {dow}"
+            )
+            return
+        if self.symbol in ZDTEMAP.keys() and dow > 4 :
+            logger.error(
+                f"This is an index option but this is an invalid contract Day of Week {dow}"
+            )
+            return
+
+
+        # verify we have quotes enabled to get the current price...
+        await self.runoplive("add", f'"{self.symbol}"')
+
+        datestrikes = await self.runoplive(
+            "chains",
+            self.symbol,
+        )
+
+        # TODO: what about ranges where we do'nt have an underlying like NDXP doesn't mean we are subscribed to ^NDX
+        quote = self.state.quoteState[self.symbol]
+
+        # prices are NaN until they get populated...
+        # (and sometimes this doesn't work right after hours or weekend times... thanks ibkr)
+        # TODO: we could _also_ check the bid/ask spread if the prices aren't populating.
+        while (quote.last != quote.last) or (quote.close != quote.close):
+            logger.info("[{}] Waiting for price to populate...", self.symbol)
+            await asyncio.sleep(0.25)
+
+        # this is a weird way of masking out all NaN values leaving only the good values, so we select
+        # the first non-NaN value in this order here...
+        fetchone = np.array([quote.last, quote.close])
+        currentPrice = fetchone[np.isfinite(fetchone)][0]
+
+        low = currentPrice - self.width
+        high = currentPrice + self.width
+        logger.info(
+            "[{} :: {}] Providing option chain range between [{}, {}] using current price {:,.2f}",
+            self.symbol,
+            self.width,
+            low,
+            high,
+            currentPrice,
+        )
+
+        # TODO: for same-day expiry, we should be checking if the time of 'now' is >= (16, 15) and then use the next chain date instead.
+        # Currently, if you request 'range' for daily options at like 5pm, it still gives you the same-day already expired options.
+        now = pendulum.now("US/Eastern")
+        today = str(now.date()).replace("-", "")
+        generated = []
+
+        # we need to sort by the date values since the IBKR API returns dates in a random order...
+        for date, strikes in sorted(
+            datestrikes[self.symbol].items(), key=lambda x: x[0]
+        ):
+            # don't generate strikes in the past...
+            if date < today or date > contractDateNum:
+                logger.warning("[{}] Skipping date is not desired...", date)
+                continue
+
+            logger.info("[{}] Using date as basis for strike generation...", date)
+            for strike in strikes:
+                if low < strike < high:
+                    for pc in ("P", "C"):
+                        optionSymbol = "{}{}{}{:0>8}".format(
+                                self.symbol,
+                                date[2:],
+                                pc,
+                                int(strike * 1000),
+                            )
+                        contracts = [contractForName(optionSymbol)]
+                        contracts = await self.state.qualify(*contracts)
+
+                        for contract in contracts:
+                            data = self.ib.reqMktData(
+                                    contract,
+                                    tickFieldsForContract(contract),
+                                    )
+                            logger.info(data)
+                        #logger.info(self.state.currentQuote(optionSymbol))
+                        generated.append(optionSymbol)
+
+            # only print for THE FIRST DATE FOUND
+            # (so we don't end up writing these out for every daily expiration or
+            #  an entire month of expirations, etc)
+            break
+
+        for row in generated:
+            logger.info("Got: {}", row)
+
+        out = f"strikes-{self.symbol}.txt"
+        pathlib.Path(out).write_text("\n".join(generated) + "\n")
+
+        logger.info("[{} :: {}] Saved strikes to: {}", self.symbol, self.width, out)
+
 
 @dataclass
 class IOpOptionChainRange(IOp):
@@ -5021,6 +5462,7 @@ OP_MAP = {
         "rm": IOpQuotesRemove,
         "chains": IOpOptionChain,
         "range": IOpOptionChainRange,
+        "rangedte": IOpOptionChainRangeDTE,
     },
     "Order Management": {
         "limit": IOpOrderLimit,
@@ -5035,6 +5477,7 @@ OP_MAP = {
         "runstrat": IOpRunStrategy,
         "bo1" : IOpBuyOptionStrategy1,
         "borb1" : IOpBuyORBStrategy1,
+        "showstrat" : IOpShowStrats,
     },
     "Portfolio": {
         "balance": IOpBalance,

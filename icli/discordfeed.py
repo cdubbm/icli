@@ -14,7 +14,7 @@ import websockets
 CONFIG_DEFAULT = dict(
     ICLI_IBKR_HOST="127.0.0.1", ICLI_IBKR_PORT=4001, ICLI_REFRESH=3.33
 )
-CONFIG = {**CONFIG_DEFAULT, **dotenv_values(".env.icli"), **os.environ}
+CONFIG = {**CONFIG_DEFAULT, **dotenv_values("../.env.icli"), **os.environ}
 
 # Create the bot
 BOT_TOKEN: str = CONFIG["BOT_TOKEN"]
