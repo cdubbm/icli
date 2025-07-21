@@ -537,6 +537,8 @@ class IBKRCmdlineApp:
     exiting: bool = False
     strategy: dict[str, dict] = field(default_factory=dict)
     barState: dict[str, OHLC5MinTracker] = field(default_factory=dict)
+    running = defaultdict(lambda: False)
+    internalPositions: dict[str, int] = field(default_factory=dict)
 
     ol: buylang.OLang = field(default_factory=buylang.OLang)
     quotehistory: dict[int, deque[float]] = field(
@@ -1830,6 +1832,18 @@ class IBKRCmdlineApp:
             fill.contract.localSymbol,
         )
 
+        symbol = trade.contract.localSymbol.replace(" ", "")
+        side = fill.execution.side  # "BOT" or "SLD"
+        qty = fill.execution.shares
+
+        # Do not assume you're always going long/flat → adjust against current state
+        prev_qty = self.internalPositions.get(symbol, 0)
+        signed_qty = qty if side == "BOT" else -qty
+        new_qty = prev_qty + signed_qty
+
+        self.internalPositions[symbol] = new_qty
+        logger.info(f"[exec] {symbol}: {side} {qty} → {new_qty} total")
+
         if fill.execution.cumQty > 0:
             if trade.contract.conId not in self.pnlSingle:
                 self.pnlSingle[trade.contract.conId] = self.ib.reqPnLSingle(
@@ -1883,9 +1897,17 @@ class IBKRCmdlineApp:
                 barData = self.barState.get(name)
                 if c.secType == 'OPT':
                     barData.update(datetime.datetime.now(), self.quoteState.get(name).modelGreeks.undPrice)
-                asyncio.create_task(
-                    self.dispatch.runop("runstrat", f'"{name}" "{algo}" "{start}"', self.opstate)
-                )
+
+                if not self.running[name]:
+                    self.running[name] = True
+
+                    async def safe_runop(symbol=name, algo=algo, start=start):
+                        try:
+                            await self.dispatch.runop("runstrat", f'"{symbol}" "{algo}" "{start}"', self.opstate)
+                        finally:
+                            self.running[symbol] = False
+
+                    asyncio.create_task(safe_runop())
 
 
             # this is a synthetic memory-having ATR where we just feed it price data and
@@ -3320,6 +3342,12 @@ class IBKRCmdlineApp:
                         self.pnlSingle[p.contract.conId] = self.ib.reqPnLSingle(
                             self.accountId, "", p.contract.conId
                         )
+
+                    positions = self.ib.positions()
+                    for account, contract, position, avgCost in positions:
+                        symbol = contract.localSymbol.replace(" ", "")
+                        self.internalPositions[symbol] = position
+                        logger.info(f"[init] seeded {symbol} = {position} from portfolio")
 
                     # run some startup accounting subscriptions concurrently
                     await asyncio.gather(

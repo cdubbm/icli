@@ -3060,6 +3060,12 @@ class IOpStrat1(IOp):
                 {"stopLoss": 0, "stopLossQty": 0, "takeProfit": 0, "takeProfQty": 0, "isTrail": True, },
         }
 
+        position = self.state.internalPositions.get(symbol, None)
+        if position is None:
+            logger.error(f"no position found for {symbol}, aborting strategy")
+            self.state.strategy.pop(symbol, None)
+            return
+
         ords = self.ib.portfolio()
 
         f = False
@@ -3076,16 +3082,13 @@ class IOpStrat1(IOp):
             return
 
         else:
-            strategyState = self.state.strategy[symbol]
-            if strategyState is None:
+            if symbol not in self.state.strategy:
                 logger.error(f"there is some issue with finding the strategy for {symbol}")
                 logger.error(f"{self.state.strategy}")
-
-            if "lock" in strategyState and strategyState["lock"]:
-                # logger.info("strategy is locked, cannot continue")
                 return
 
-            strategyState["lock"] = True
+            strategyState = self.state.strategy[symbol]
+
             t = myPos.contract.secType
 
             quote: Ticker = self.state.quoteState.get(symbol)
@@ -3094,10 +3097,8 @@ class IOpStrat1(IOp):
             #logger.info(f"{bar.previous_bar} {bar.get_current_bar()} {myPos.contract.right}")
 
             avgCost = None
-            pnlPercentage = None
 
             if t == "OPT":
-                pnlPercentage = (myPos.marketPrice * 100 - myPos.averageCost) / myPos.averageCost * 100
                 avgCost = myPos.averageCost / 100
 
             ticker = self.state.quoteState[symbol]
@@ -3123,7 +3124,6 @@ class IOpStrat1(IOp):
                     self.updateParent(myPos.contract.tradingClass, "W")
 
                 if stratState == "Z" or myPos.position < 1:
-                    strategyState["lock"] = False
                     self.state.strategy.pop(symbol, None)
                     return
 
@@ -3138,13 +3138,13 @@ class IOpStrat1(IOp):
                     #logger.debug(f"strategy S1 is in state {stratState} and {myPos} {pnlPercentage} {avgCost} {mktPrice}")
                     if "SL" not in  strategyState and pnlPercentage <= (level.get("stopLoss")*100) :
                         self.updateParent(myPos.contract.tradingClass,"SL0")
-                        amount = math.ceil(myPos.position * level.get("stopLossQty"))
+                        amount = math.ceil(position * level.get("stopLossQty"))
                         logger.info(f"Hit stop loss for {symbol} {pnlPercentage} selling {amount}")
                         await self.runoplive("buy", f"{symbol} -{amount} AMF")
                         if ICLI_AWWDIO_URL:
                             await self.runoplive("say", f"first stop loss reached on  {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
+                        await asyncio.sleep(5)
                         strategyState["start"] = "Z"
-                        strategyState["lock"] = False
                         return
 
                     # logger.error(f"prev: {bar.previous_bar} this: {bar.current_bar}")
@@ -3157,24 +3157,24 @@ class IOpStrat1(IOp):
                         prevClose = bar.previous_bar["close"]
                         prevTimestamp = bar.previous_bar["timestamp"]
                         self.updateParent(myPos.contract.tradingClass, "SL0")
-                        amount = math.ceil(myPos.position * level.get("stopLossQty"))
+                        amount = math.ceil(position * level.get("stopLossQty"))
                         logger.info(f"Hit PRICE stop loss on underlying stock {symbol} {pnlPercentage} selling {amount} open/close:{prevOpen}/{prevClose} @ {prevTimestamp}")
                         await self.runoplive("buy", f"{symbol} -{amount} AMF")
                         if ICLI_AWWDIO_URL:
                             await self.runoplive("say", f"first stop loss reached on {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
+                        await asyncio.sleep(5)
                         strategyState["start"] = "Z"
-                        strategyState["lock"] = False
                         return
 
                     if pnlPercentage > (level.get("takeProfit") *100):
                         self.updateParent(myPos.contract.tradingClass, "TP1")
-                        amount =  math.ceil(myPos.position * level.get("takeProfQty"))
+                        amount =  math.ceil(position * level.get("takeProfQty"))
                         logger.info(f"Hit first take profit for {symbol} {pnlPercentage}, selling {amount} ")
                         await self.runoplive("buy", f"{symbol} -{amount} AMF")
                         if ICLI_AWWDIO_URL:
                             await self.runoplive("say", f"took first profit on {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
+                        await asyncio.sleep(5)
                         strategyState["start"] = "L1"
-                        strategyState["lock"] = False
                         return
 
                 if stratState == "L1" :
@@ -3182,53 +3182,51 @@ class IOpStrat1(IOp):
                     #logger.debug(f"strategy S1 is in state {stratState} {pnlPercentage} {avgCost} {mktPrice} {tp}" )
                     if pnlPercentage <= (level.get("stopLoss")*100):
                         self.updateParent(myPos.contract.tradingClass, "SL1")
-                        amount =  math.ceil(myPos.position * level.get("stopLossQty"))
+                        amount =  math.ceil(position * level.get("stopLossQty"))
                         logger.info(f"Hit stop loss for {symbol} {pnlPercentage} selling {amount}")
                         await self.runoplive("buy", f"{symbol} -{amount} AMF")
                         if ICLI_AWWDIO_URL:
                             await self.runoplive("say", f"second stop loss reached on  {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
+                        await asyncio.sleep(5)
                         strategyState["start"] = "Z"
-                        strategyState["lock"] = False
                         return
 
                     if pnlPercentage > (level.get("takeProfit") *100):
                         self.updateParent(myPos.contract.tradingClass, "TP2")
-                        amount =  math.ceil(myPos.position * level.get("takeProfQty"))
+                        amount =  math.ceil(position * level.get("takeProfQty"))
                         logger.info(f"Hit second take profit for {symbol} {pnlPercentage}, selling {amount} ")
                         await self.runoplive("buy", f"{symbol} -{amount} AMF")
                         if ICLI_AWWDIO_URL:
                             await self.runoplive("say", f"took additional profit {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
+                        await asyncio.sleep(5)
                         strategyState["start"] = "L2"
-                        strategyState["lock"] = False
                         return
 
                 if stratState == "L2":
                     #logger.debug(f"strategy S1 is in state {stratState} {pnlPercentage} {avgCost} {mktPrice}")
                     trailStop = strategyState.get("highPrice") * (1 + level.get("stopLoss"))
 
-                    if trailStop <= mktPrice:
+                    if mktPrice <= trailStop :
                         self.updateParent(myPos.contract.tradingClass, "SLR")
-                        amount = myPos.position
+                        amount = position
                         logger.info(f"Hit stop loss for {symbol} {pnlPercentage} selling {amount}")
                         await self.runoplive("buy", f"{symbol} -{amount} AMF")
                         if ICLI_AWWDIO_URL:
                             await self.runoplive("say", f"runner stop loss reached {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
+                        await asyncio.sleep(5)
                         strategyState["start"] = "Z"
-                        strategyState["lock"] = False
                         return
 
                 if not isFuture and untilClose.seconds <= 300 :
                     self.updateParent(myPos.contract.tradingClass, "TPR")
-                    amount = myPos.position
+                    amount = position
                     logger.info(f"Contract is going to expire, we are in state {stratState}, selling before the close, as not hit either SL or PT {symbol} {pnlPercentage} selling {amount}")
                     await self.runoplive("buy", f"{symbol} -{amount} AMF")
                     if ICLI_AWWDIO_URL:
                         await self.runoplive("say", f"runners took profit {myPos.contract.tradingClass} {myPos.contract.right} selling {amount} contracts")
+                    await asyncio.sleep(5)
                     strategyState["start"] = "Z"
-                    strategyState["lock"] = False
                     return
-
-                strategyState["lock"] = False
 
                 return
 
@@ -3469,6 +3467,7 @@ class IOpBuyORBStrategy1(IOp):
 
     async def run(self, symbol):
         self.state = self.state.state
+        buffer=0.28
         contract = None
         debug = False
         opendate = None
@@ -3483,14 +3482,18 @@ class IOpBuyORBStrategy1(IOp):
             return True
 
         if debug :
-            opendate = datetime.date(2025,6,26) #TODO: this needs to be fixed to the current date.
+            opendate = datetime.date(2025,7,16) #TODO: this needs to be fixed to the current date.
         else:
             opendate = datetime.datetime.now().date()
 
         opentime = datetime.time(9,30,0,0,tzinfo=ZoneInfo("America/New_York"))
         curtime = datetime.datetime.now(tz=ZoneInfo("America/New_York"))
+
         if 'lastCheckTime' not in self.state.strategy[symbol]:
-            self.state.strategy[symbol]['lastCheckTime'] = curtime
+            if debug:
+                self.state.strategy[symbol]['lastCheckTime'] = datetime.datetime.combine(opendate, opentime)
+            else:
+                self.state.strategy[symbol]['lastCheckTime'] = curtime
 
         lasttime = self.state.strategy[symbol]['lastCheckTime']
 
@@ -3523,7 +3526,7 @@ class IOpBuyORBStrategy1(IOp):
             await self.runoplive("add", f'"{symbol}"')
 
         if curState["start"] == "S":
-            if self.alignedtime(curtime) <= self.alignedtime(lasttime):
+            if self.alignedtime(curtime) <= self.alignedtime(lasttime) and not debug:
                 return
 
             contract = Stock(symbol, 'SMART', 'USD')
@@ -3541,8 +3544,8 @@ class IOpBuyORBStrategy1(IOp):
             openBarFound = False
             for bar in bars:
                 if bar.date == datetime.datetime.combine(opendate, opentime):
-                    curState["orbHigh"] = bar.high
-                    curState["orbLow"] = bar.low
+                    curState["orbHigh"] = bar.high + buffer
+                    curState["orbLow"] = bar.low - buffer
                     curState["orbTime"] = bar.date
                     curState["start"] = "O"
                     curState["desc"] = "opening range set, waiting for breakout"
@@ -3594,42 +3597,36 @@ class IOpBuyORBStrategy1(IOp):
                 orbHigh = curState["orbHigh"]
                 orbLow = curState["orbLow"]
                 # logger.info(f"{bar.date} == {self.alignedtime(curtime-datetime.timedelta(seconds=300))}")
-                if bar.open > curState["orbHigh"] and bar.close > curState["orbHigh"]:
+                if bar.open >= curState["orbHigh"] and bar.close >= curState["orbHigh"]:
                     outside = True
                     inside = False
                     if not stale:
                         outsideCount += 1
                         if bar.date == self.alignedtime(curtime-datetime.timedelta(seconds=300)):
-                            if bar.volume > (prevVolume*1.10) and bar.volume < (prevVolume*1.9):
-                                logger.info(f"{symbol}: valid breakout found C")
-                                breakoutCount += 1
-                                direction = "C"
-                                breakoutFound = True
-                                inside = False
-                                break
-                            else :
-                                logger.info(f"{symbol}: fake breakout found C")
-                                stale = True
+
+                            logger.info(f"{symbol}: valid breakout found C")
+                            breakoutCount += 1
+                            direction = "C"
+                            breakoutFound = True
+                            inside = False
+                            break
+
                         else:
                             stale = True
                             # logger.info("stale breakout found")
 
-                elif bar.open < curState["orbLow"] and bar.close < curState["orbLow"]:
+                elif bar.open <= curState["orbLow"] and bar.close <= curState["orbLow"]:
                     outside = True
                     inside = False
                     if not stale:
                         outsideCount += 1
                         if bar.date == self.alignedtime(curtime-datetime.timedelta(seconds=300)):
-                            if bar.volume > (prevVolume*1.10) and bar.volume < (prevVolume*1.9):
-                                logger.info(f"{symbol}: valid breakout found P")
-                                breakoutCount += 1
-                                direction = "P"
-                                breakoutFound = True
-                                inside = False
-                                break
-                            else:
-                                logger.info(f"{symbol}: fake breakout found P")
-                                stale = True
+                            logger.info(f"{symbol}: valid breakout found P")
+                            breakoutCount += 1
+                            direction = "P"
+                            breakoutFound = True
+                            inside = False
+                            break
                         else:
                             stale = True
                             # logger.info("stale breakout found")
@@ -3650,11 +3647,16 @@ class IOpBuyORBStrategy1(IOp):
             if breakoutFound:
                 amount = 1000
 
-                sl = bar.low if direction == "C" else bar.high
+               # sl = bar.low if direction == "C" else bar.high
+                sl = orbHigh if direction == "C" else orbLow
+                if not debug:
+                    optionToTrade, strike, dte = await self.getChains(symbol,0,10, direction)
+                else:
+                    logger.info(f"breakoutfound {direction} {bar.date}")
+                    curState["start"] = "B"
+                    return
 
-                optionToTrade, strike, dte = await self.getChains(symbol,0,10, direction)
-
-                if strike > 0:
+                if strike > 0 and not debug:
                     await self.runoplive("bo1", f'{symbol} {strike} {direction} ${amount} {dte} SL:{sl}')
 
                     curState["option"] = optionToTrade
@@ -3671,7 +3673,7 @@ class IOpBuyORBStrategy1(IOp):
                     curState["start"] = "A"
                     curState["desc"] = "abort could not find a strike / option that made sense"
 
-        if curState["start"] == "B":
+        if curState["start"] == "B" and not debug:
             option = curState["option"]
             fromSub = None
             if "subState" in curState:
@@ -3685,6 +3687,12 @@ class IOpBuyORBStrategy1(IOp):
 
             if (fromSub== "SL1" or fromSub== "SL0") and curState["entries"] < 4 :
                 logger.info(f"substrategy for {option} hit state {fromSub}, setting up re-entry")
+                curState.pop("subState", None)
+                curState.pop("option", None)
+                curState.pop("breakoutDirection", None)
+                curState.pop("breakoutTime", None)
+                curState.pop("breakoutFound", None)
+                curState["desc"] = "Rearmed for reentry"
                 curState["start"] = "O"
             elif fromSub== "SLR" or fromSub== "TPR":
                 curState["start"] = "Z"
@@ -3820,7 +3828,15 @@ class IOpBuyOptionStrategy1(IOp):
         await asyncio.sleep(4)
         extra = " ".join(self.extras)
         if not previewSet:
-            await self.runoplive("setstrat", f'"{fullSymbol}" "S1" "L0" {extra}')
+            retries=3
+            while retries > 0:
+                logger.info(f"setting strategy for {fullSymbol} {retries}")
+                await self.runoplive("setstrat", f'"{fullSymbol}" "S1" "L0" {extra}')
+                await asyncio.sleep(15)
+                if fullSymbol in self.state.strategy:
+                    break
+                retries-=1
+
         return True
 
 @dataclass
